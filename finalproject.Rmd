@@ -1,0 +1,407 @@
+---
+title: "Are nonviolent campaigns more successful than their violent counterparts?"
+output: html_notebook
+---
+
+# 1. Introduction
+## 1.1 Load and check data
+
+First thing first, we need to load the packages we're going to use for this project.
+```{r}
+library(readxl) # data loading
+library(tidyverse) # data manipulation and visualization
+library(sjPlot) # contingency table
+library(caret)
+library(ggplot2) # fancy graphs
+library(cowplot) # improve ggplot2's default settings
+library(randomForest) # make random forests...
+```
+Then we load the dataset NAVCO 1.3:
+
+* Global campaign-level data about violent and nonviolent campaigns with maximalist goals (regime change, anti-occupation, and secession)
+* Time period: 1900-2006 
+* Dimensions: 622 x 16 
+```{r}
+data <- read_excel("C:/Users/Asus/Documents/NAVCO 1.3/NAVCO 1.3 List.xlsx")
+```
+Check data
+```{r}
+str(data)
+```
+We're probably going to work with 16 variables and 622 observations. Just probably.
+
+# 2. Feature Engineering
+
+As we are interested in exploring the outcomes of the campaigns, the variables `SUCCESS`, `LIMITED`, and `FAILURE`, which are coded as the results of the campaigns, should catch our attention.
+
+* `SUCCESS` is supposed to be a factor where 1 indicates that the campaign **completely** achieved its stated goals and this success is the direct result of the campaign itself while 0 means otherwise.
+* `LIMITED` is supposed to be a factor where 1 indicates that the campaign **partially** achieved its stated goals, some concessions were made by the target of the campaign, and/or some reforms kicked in while 0 means otherwise.
+* `FAILURE` is supposed to be a factor where 1 indicates that the campaign achieved **none** of its stated goals and was suppressed while 0 means otherwise.
+
+These campaign results should be combined into just 1 column since later we will use this column as a predictor. For the matter of simplicity, we will assume that limited success here implies success, meaning that a campaign either succeeds or fails (in the absolute sense of the words). This `results` variable is supposed to be a factor with two levels, `Success` and `Failure`.
+```{r}
+data$results <- NA # add a column named "results" and specify the records of this column to be NULL
+for (row in 1:nrow(data)){
+  if (data[row, "SUCCESS"]==1){
+    data[row, "results"]<-"Success"
+  }
+  else if (data[row, "LIMITED"]==1){
+    data[row, "results"]<-"Success"
+  }
+  else if (data[row, "FAILURE"]==1){
+    data[row, "results"]<-"Failure"
+  }
+}
+```
+
+Check if there is any campaign of which the result has not been specified:
+```{r}
+sum(is.na(data$results))
+```
+Remove these rows with missing values:
+```{r}
+data <- data %>% filter(!is.na(results))
+```
+Now we have 620 observations left.
+
+The next variables that we care about are `VIOL` and `NONVIOL`. 
+
+* The `VIOL` variable takes on value `1` if the campaign is primarily violent and 0 if otherwise. 
+* The `NONVIOL` variable takes on value `1` if the campaign is primarily nonviolent and 0 if otherwise.
+
+Since a campaign is classified as either violent or nonviolent, again, we should have a dummy variable that specifies the violence or the lack thereof of a campaign. Oh, we can just use the `VIOL` variable for this. But this time we have to specify `1` as `Violent` and `0` as `Nonviolent`. 
+```{r}
+data$VIOL <- ifelse(test=data$VIOL==1, yes="Violent", no="Nonviolent")
+```
+Next, we will take care of the campaign goals. 
+
+Similar to what we do with the outcomes of the campaigns, we'll create a column named `goals`. For any row, 
+
+* if `FSELFDET` = 1, the `goals` would be `Independence`. Here independence means independence from a foreign or colonial power. 
+* if `REGCHANGE` = 1, the `goals` would be `Regime change`. Specifically, it means the removal of incumbent national leaders.
+* if `SECESSION`= 1, the `goals` would be `Secession`, meaning territorial separatism from an existing state.
+```{r}
+for (row in 1:nrow(data)){
+  if (data[row, "FSELFDET"]==1){
+    data[row, "goals"]<-"Independence"
+  }
+  else if (data[row, "REGCHANGE"]==1){
+    data[row, "goals"]<-"Regime change"
+  }
+  else if (data[row, "SECESSION"]==1){
+    data[row, "goals"]<-"Secession"
+  }
+}
+```
+Check if there is any campaign of which the goal has not been specified:
+```{r}
+sum(is.na(data$goals))
+```
+Remove these rows with missing values:
+```{r}
+data <- data %>% filter(!is.na(goals))
+```
+Convert the columns into factors:
+```{r}
+data$VIOL <- as.factor(data$VIOL)
+data$goals <- as.factor(data$goals)
+data$results <- as.factor(data$results)
+```
+Drop other columns that we're not going to use:
+```{r}
+data <- select(data, -c(NAVCOID, CAMPAIGN, LOCATION, BYEAR, EYEAR, TARGET, SUCCESS, NONVIOL, LIMITED, FAILURE, ONGOING, FSELFDET, REGCHANGE, SECESSION, OTHER))
+```
+Our outcome variable is being the second column, so a little rearrangement needs to be done to move it to the rightmost:
+```{r}
+data <- data[, c(1,3,2)]
+```
+Rename `VIOL` column to be lowercase:
+```{r}
+data <- data %>% rename(viol=VIOL)
+```
+Check the data that we're going to use moving forward:
+```{r}
+str(data)
+```
+
+Now we're going to draw some mosaic plots to better understand the relationships between the variables:
+
+### Violence vs. Results
+```{r}
+mosaicplot(table(data$viol, data$results), main='Violence levels by Campaign results', shade=TRUE)
+```
+#### Understanding the standardized residuals
+
+The standardized residual (strength and direction of association) measures the departure from the independence hypothesis. In other words, it means how much the observed values deviate from the values in the case where there is no association among the variables. 
+
+* The absolute value of the residual is the strength of the association
+* The sign of the residual is the direction (negative or positive association)
+* The bluer the cell, the more observations in that cell than would be expected under the null model (independence). The redder the cell, the fewer observations in that cell than would be expected
+
+A few takeaways from this graph:
+
+* The shares of nonviolent and violent campaigns are roughly equal
+* Nonviolent campaigns will almost be successful while violent campaigns will mostly fail
+* The number of successful nonviolent campaigns is twice that of successful violent campaigns
+
+The contingency table behind this mosaic plot:
+```{r}
+viol.vs.results <- data %>% select(viol, results)
+
+viol.vs.results %>%
+  sjtab(fun = "xtab", var.labels=c("Violence levels", "Campaign results"),
+        show.row.prc=T, show.col.prc=T, show.summary=T, show.exp=T, show.legend=T)
+```
+
+### Results vs. Goals
+```{r}
+mosaicplot(table(data$results, data$goals), main='Campaign results by Campaign goals', shade=TRUE)
+```
+Takeaway:
+
+* Nothing much, just that separatist campaigns are very likely to fail
+* The majority of successful campaigns aim for a change in regime, though the majority of failed campaigns share the same goal
+
+### Goals vs. Violence
+```{r}
+mosaicplot(table(data$goals, data$viol), main='Campaign goals by Violence levels', shade=TRUE)
+```
+Takeaways:
+
+* Campaigns aiming at overthrowing incumbent national leaders are mostly nonviolent
+* Campaigns that seek self-determination or independence from a foreign/colonial power and those that aim for territorial secession/separatism are mostly violent
+
+# 3. Prediction
+
+## 3.1 Split the data into training and test sets
+```{r}
+nrows <- nrow(data)
+set.seed(218)                           ## fix random value
+index <- sample(1:nrows, 0.7 * nrows)   ## shuffle and divide
+#data                                   ## 609 rows of data (100%)
+train <- data[index,]                   ## 426 rows of data (70%)
+test <- data[-index,]                   ## 183 rows of data (30%)
+```
+
+```{r}
+train
+```
+```{r}
+test
+```
+## 3.2 Building the model
+### 3.2.1 Logistic regression
+```{r}
+xtabs(~ results+viol, data=data)
+```
+```{r}
+xtabs(~ results+goals, data=data)
+```
+```{r}
+model.logit <- glm(results ~ ., data=train, family="binomial")
+summary(model.logit)
+```
+```{r}
+library(pscl)
+pR2(model.logit)["McFadden"]
+```
+The pseudo R-squared (or the McFadden's R-squared) is quite low, suggesting that the model does not fit the data very well.
+
+### 3.2.2 Decision tree
+```{r}
+# create a formula
+formula = results ~ .
+
+# train the tree
+model.tree = rpart(formula, data=train, method='class')
+
+# view the tree summary
+summary(model.tree)
+
+```
+```{r}
+rpart.plot(model.tree)
+```
+Interpretations of this model:
+
+* At the root node at the top, the overall probability of success if 47%
+* This node asks whether the campaign is `violent`. If yes, we go down to the root's left child. Here the chance of succeeding is 32% or the chance of failing is 68%. Otherwise, we go down to the root's right child. Here's the chance of succeeding is much higher, 61% (the result is classified as failure)
+* Here it continues by asking whether the goal of the campaign is `secession`. If yes, it goes down to the left, suggesting a chance of succeeding of a low 33% (the result is classified as failure). Otherwise, it does down to the right, suggesting a chance of succeeding of 63% (hence the result is classified as success)
+
+```{r}
+predicted.tree <- predict(model.tree, test[,-3], type='class')
+predicted.tree
+```
+```{r}
+cm.tree <- confusionMatrix(test$results, predicted.tree)
+cm.tree
+```
+The accuracy of the model for the test dataset is 61.2%.
+
+### 3.2.3 Random forest
+
+We re-check the structure of the data:
+```{r}
+str(data)
+```
+Set the seed for the random number generator so that we can reproduce our results:
+```{r}
+set.seed(42)
+```
+Let's build our random forest:
+```{r}
+model.rf <- randomForest(results ~ ., data=train, ntree=1000, proximity=T, importance=T)
+model.rf
+```
+Plot the error rates for all the trees in the forest:
+```{r}
+oob.error.data <- data.frame(
+  Trees=rep(1:nrow(model.rf$err.rate), times=3),
+  Type=rep(c("OOB", "Failure", "Success"), each=nrow(model.rf$err.rate)),
+  Error=c(model.rf$err.rate[,"OOB"], 
+          model.rf$err.rate[,"Failure"], 
+          model.rf$err.rate[,"Success"]))
+ggplot(data=oob.error.data, aes(x=Trees, y=Error)) + geom_line(aes(color=Type))
+```
+The random forest with 500 trees is already pretty stable. 
+
+Now we're going to draw a multidimensional scaling plot to see how the samples are related to each other:
+```{r}
+distance.matrix <- as.dist(1-model.rf$proximity)
+
+mds.stuff <- cmdscale(distance.matrix, eig=TRUE, x.ret=TRUE)
+
+## calculate the percentage of variation that each MDS axis accounts for...
+mds.var.per <- round(mds.stuff$eig/sum(mds.stuff$eig)*100, 1)
+
+## now make a fancy looking plot that shows the MDS axes and the variation:
+mds.values <- mds.stuff$points
+mds.data <- data.frame(Sample=rownames(mds.values),
+                       X=mds.values[,1],
+                       Y=mds.values[,2],
+                       Status=train$results)
+
+ggplot(data=mds.data, aes(x=X, y=Y, label=Sample)) + 
+  geom_text(aes(color=Status)) +
+  theme_bw() +
+  xlab(paste("MDS1 - ", mds.var.per[1], "%", sep="")) +
+  ylab(paste("MDS2 - ", mds.var.per[2], "%", sep="")) +
+  ggtitle("MDS plot using (1 - Random Forest Proximities)")
+```
+The x-axis accounts for 65.2% of the variation in the distance matrix. The y-axis accounts for 17.8% of the variation in the distance matrix. The big differences are along the x-axis. 
+
+Now it's time for prediction!
+```{r}
+predicted.rf <- predict(model.rf, newdata=test[,-3])
+cm.rf <- confusionMatrix(test$results, predicted.rf)
+cm.rf
+```
+```{r}
+varImpPlot(model.rf)
+```
+Let's try out another dataset: NAVCO 3.0
+
+* 21 countries, not globally representative but geographically covering Asia, Middle East, Africa, Europe, Latin America (at least 1 from each of these major regions, oversampling Middle East and Africa) -> diverse political systems, economies and histories of contention 
+* Event-level data
+* Includes government behavior (repressive actions taken by the government)  
+* Anti-government campaign goals (camp_goals): 	maximalist (regime change, anti-foreign occupation, secession), reformist (major institutional transformation, policy change, and greater autonomy), and a group of unknown goals. 
+* Time period: 1990-2012 
+* Dimensions: 112,381 x 37 
+```{r}
+data2 <- read_excel('C:/Users/Asus/Documents/NAVCO 3.0 Dataset/navco3-0full.xlsx')
+str(data2)
+```
+Only select data where `actor_id` = 2, which are anti-government campaigns.
+```{r}
+antigov <- filter(data2, actor_id==2)
+```
+Remove data where `tactical_choice` = 2, which are campaigns that employ both nonviolent and violent tactics.
+```{r}
+antigov <- filter(antigov, tactical_choice!=2)
+```
+The government responses are re-categorized into 3 groups: accommodation, neutral, and repression:
+```{r}
+antigov <- filter(antigov, !is.na(st_posture))
+antigov <- filter(antigov, st_posture!=0)
+```
+
+```{r}
+antigov$gov.response <- NA
+antigov$gov.response[antigov$st_posture < 4] <- "accommodation"
+antigov$gov.response[antigov$st_posture == 4] <- "neutral"
+antigov$gov.response[antigov$st_posture > 4] <- "repression"
+```
+
+```{r}
+antigov$geo_scope <- as.factor(antigov$geo_scope)
+antigov$camp_goals <- as.factor(antigov$camp_goals)
+antigov$tactical_choice <- as.factor(antigov$tactical_choice)
+antigov$nv_categ <- as.factor(antigov$nv_categ)
+antigov$nc_type <- as.factor(antigov$nc_type)
+antigov$nv_commission <- as.factor(antigov$nv_commission)
+antigov$nv_concentration <- as.factor(antigov$nv_concentration)
+antigov$gov.response <- as.factor(antigov$gov.response)
+```
+
+```{r}
+antigov <- select(antigov, -c(coder, event_desc, cowcode, date, source_title, actor_id, localities, cameo_actor_3, cameo_actor_6, cameo_actor_9, event_actor_list, verb_10, verb_100, verb_1000, target_3, target_6, target_9, nv_tactic_ns, v_tactic_ns, fatal_casu, injuries, num_partic_event, damage, econ_impact, econ_impact_aux, arbitration, st_posture, notes, decision))
+```
+
+```{r}
+str(antigov)
+```
+
+```{r}
+set.seed(42)
+antigov.imputed <- rfImpute(gov.response ~ ., data=antigov[,-1], iter=6)
+```
+```{r}
+mosaicplot(table(antigov.imputed$tactical_choice, antigov.imputed$gov.response), main='Violence levels by Government responses', shade=TRUE)
+```
+Takeaways:
+
+* Violent events (coded as `0`) will almost always be repressed and will hardly be responded neutrally or with accommodation
+* Nonviolent events (coded as `1`) will almost always be met with responses from full accommodation to neutrality
+
+```{r}
+nrows <- nrow(antigov.imputed)
+set.seed(218)                           ## fix random value
+index <- sample(1:nrows, 0.7 * nrows)   ## shuffle and divide
+#antigov.imputed                        ## 9208 rows of data (100%)
+train2 <- antigov.imputed[index,]       ## 6445 rows of data (70%)
+test2 <- antigov.imputed[-index,]       ## 2763 rows of data (70%)
+```
+
+
+```{r}
+model2.rf <- randomForest(gov.response ~ ., data=train2, proximity=T)
+model2.rf
+```
+
+
+```{r}
+oob.error.data2 <- data.frame(
+  Trees=rep(1:nrow(model2.rf$err.rate), times=4),
+  Type=rep(c("OOB", "accommodation", "neutral", "repression"), each=nrow(model2.rf$err.rate)),
+  Error=c(model2.rf$err.rate[,"OOB"], 
+          model2.rf$err.rate[,"accommodation"], 
+          model2.rf$err.rate[,"neutral"],
+          model2.rf$err.rate[,"repression"]))
+ggplot(data=oob.error.data2, aes(x=Trees, y=Error)) + geom_line(aes(color=Type))
+```
+```{r}
+predicted2.rf <- predict(model2.rf, newdata=test2[,-1])
+cm.rf <- confusionMatrix(test2$gov.response, predicted2.rf)
+cm.rf
+```
+
+```{r}
+model2.tree = rpart(gov.response ~ ., data=train2, method='class')
+
+# view the tree summary
+summary(model2.tree)
+```
+
+```{r}
+rpart.plot(model2.tree)
+```
